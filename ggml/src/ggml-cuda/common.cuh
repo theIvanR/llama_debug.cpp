@@ -312,7 +312,19 @@ static bool fast_fp16_hardware_available(const int cc) {
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2);
 }
 
-// To be used for feature selection of external libraries, e.g. cuBLAS.
+// To be used for cuBLAS GEMM algorithm selection.
+// NVIDIA Tensor-Op GEMM is available from Volta (SM 7.0) onward.
+// Preserve the existing Tensor-Op behavior for non-NVIDIA backends.
+static bool cublas_tensor_op_hardware_available(const int cc) {
+    return !GGML_CUDA_CC_IS_NVIDIA(cc) || cc >= GGML_CUDA_CC_VOLTA;
+}
+
+// To be used for cuBLAS TF32 math-mode selection.
+// TF32 is an Ampere (SM 8.0) feature.
+static bool cublas_tf32_hardware_available(const int cc) {
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE;
+}
+
 static bool fp16_mma_hardware_available(const int cc) {
     return (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc) || GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
@@ -1417,6 +1429,41 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // Single-slot cache of a matvec's q8_1-quantized activation, so that the second
+    // matmul of a gate/up pair does not redo the identical quantization.  The key is cleared at
+    // the top of every graph compute because it holds a tensor pointer, which a later graph may
+    // reuse; the buffer itself is kept.
+    //
+    // The buffer is a plain device allocation, NOT a pool one.  The pool is a stack allocator that
+    // asserts every free is the top of the stack, so holding a pool allocation across calls breaks
+    // it whenever a caller allocates before mul_mat_vec_q and frees after -- which is exactly what
+    // ggml_cuda_mul_mat_id's sorted-gather path does.  It grows and is never shrunk, so after
+    // warmup there are no allocations at all.
+    char *              q8_1_cache_mem    = nullptr;
+    size_t              q8_1_cache_cap    = 0;
+    const ggml_tensor * q8_1_cache_src1   = nullptr;
+    const void *        q8_1_cache_data   = nullptr;
+    cudaStream_t        q8_1_cache_stream = nullptr;
+    size_t              q8_1_cache_size   = 0;
+    int64_t             q8_1_cache_s[4]   = { 0, 0, 0, 0 };
+
+    // Forget the key, keep the buffer.  Called at the top of every graph computation.
+    void q8_1_cache_clear() {
+        q8_1_cache_src1   = nullptr;
+        q8_1_cache_data   = nullptr;
+        q8_1_cache_stream = nullptr;
+        q8_1_cache_size   = 0;
+    }
+
+    void q8_1_cache_free() {
+        if (q8_1_cache_mem != nullptr) {
+            (void) cudaFree(q8_1_cache_mem);
+            q8_1_cache_mem = nullptr;
+            q8_1_cache_cap = 0;
+        }
+        q8_1_cache_clear();
+    }
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
@@ -1501,11 +1548,18 @@ struct ggml_backend_cuda_context {
         if (cublas_handles[device][curr_stream_no] == nullptr) {
             ggml_cuda_set_device(device);
             CUBLAS_CHECK(cublasCreate(&cublas_handles[device][curr_stream_no]));
-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_TF32_TENSOR_OP_MATH));
+
+            const int cc = ggml_cuda_info().devices[device].cc;
+
+            CUBLAS_CHECK(cublasSetMathMode(
+                cublas_handles[device][curr_stream_no],
+                cublas_tf32_hardware_available(cc)
+                    ? CUBLAS_TF32_TENSOR_OP_MATH
+                    : CUBLAS_DEFAULT_MATH));
+
             CUBLAS_CHECK(cublasSetStream(cublas_handles[device][curr_stream_no], stream()));
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
             if (cublas_workspace_sizes[device] == 0) {
-                const int cc = ggml_cuda_info().devices[device].cc;
                 cublas_workspace_sizes[device] = (cc >= GGML_CUDA_CC_HOPPER) ? 32 * 1024 * 1024 : 4 * 1024 * 1024;
             }
             CUDA_CHECK(cudaMalloc(&cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
@@ -1673,4 +1727,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-
